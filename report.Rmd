@@ -1,0 +1,383 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Introduction
+
+The data I chose is:
+Hotels
+- Aim is to predict if a booking will cancel or not
+- Target variable: is_canceled
+- Download: https://www.louisaslett.com/Courses/MISCADA/hotels.csv
+
+```{r}
+download.file("https://www.louisaslett.com/Courses/MISCADA/hotels.csv", "hotels.csv")
+hotels.original <- readr::read_csv("hotels.csv")
+```
+
+```{r}
+library("skimr")
+library("tidyverse")
+library("readr")
+library("ggplot2")
+library("dplyr")
+```
+
+*****
+
+# Data exploration
+
+```{r}
+View(hotels.original)
+```
+
+```{r}
+skim(hotels.original)
+```
+
+```{r}
+DataExplorer::plot_bar(hotels.original)
+```
+
+```{r}
+DataExplorer::plot_histogram(hotels.original)
+```
+```{r}
+DataExplorer::plot_density(hotels.original)
+```
+
+```{r}
+DataExplorer::plot_boxplot(hotels.original, by = "is_canceled", ncol = 3)
+```
+```{r}
+months_ordered <- c("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+hotels.original$arrival_date_month <- factor(hotels.original$arrival_date_month, levels = months_ordered, ordered = TRUE)
+
+monthly_cancellation_rate <- hotels.original %>%
+  group_by(arrival_date_month) %>%
+  summarise(cancel_rate = mean(is_canceled, na.rm = TRUE)) %>%
+  filter(!is.na(cancel_rate))
+
+ggplot(monthly_cancellation_rate, aes(x = arrival_date_month, y = cancel_rate)) +
+  geom_col(fill = "steelblue") +
+  theme_minimal() +
+  labs(x = "Month", y = "Cancellation Rate", title = "Monthly Cancellation Rate") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+*****
+# 处理数据
+
+## 删除一些无关变量
+
+```{r}
+hotels <- hotels.original |>
+  select(-reservation_status, -reservation_status_date, -assigned_room_type, -country, -agent, -company)
+```
+
+## 对数据做一些修改
+
+```{r}
+hotels <- hotels |>
+  mutate(kids = case_when(
+    children + babies > 0 ~ "kids",
+    TRUE ~ "none"
+  )) |>
+  select(-babies, -children) |>
+  mutate(parking = case_when(
+    required_car_parking_spaces > 0 ~ "parking",
+    TRUE ~ "none"
+  )) |>
+  select(-required_car_parking_spaces) |>
+  mutate(is_canceled = ifelse(is_canceled == 0, "no", "yes")) |>
+  mutate(total_nights = stays_in_weekend_nights+stays_in_week_nights) |>
+  select(-stays_in_weekend_nights, -stays_in_week_nights)
+  
+```
+
+```{r}
+hotels <- hotels %>% mutate_if(is.character, as.factor)
+```
+
+*****
+
+# 拟合评估模型
+
+```{r}
+library("mlr3")
+library("mlr3learners")
+library("data.table")
+library("mlr3verse")
+library("ranger")
+library("xgboost")
+library(mlr3misc)
+
+
+```
+
+## 定义任务
+
+```{r}
+set.seed(212) # set seed for reproducibility
+
+iscanceled_task <- TaskClassif$new(id = "iscancled",
+                               backend = hotels,
+                               target = "is_canceled",
+                               positive = "yes")
+```
+
+## 定义5-fold cross validation
+
+```{r}
+cv5 <- rsmp("cv", folds = 5)
+
+cv5$instantiate(iscanceled_task)
+```
+
+## 定义学习器
+
+```{r}
+lrn_baseline <- lrn("classif.featureless", predict_type = "prob") # 无特征学习器
+
+lrn_cart     <- lrn("classif.rpart", predict_type = "prob") # 决策树
+
+lrn_log_reg  <- lrn("classif.log_reg", predict_type = "prob") # 逻辑回归
+
+lrn_lda <- lrn("classif.lda", predict_type = "prob") # 线性判别分析模型
+
+lrn_ranger   <- lrn("classif.ranger", predict_type = "prob") # 随机森林
+
+lrn_xgboost  <- lrn("classif.xgboost", predict_type = "prob") # 梯度提升树
+
+```
+
+## 对无法处理缺失值的模型进行数据处理
+
+```{r}
+pl_missing <- po("fixfactors") %>>%
+  po("removeconstants") %>>%
+  po("imputesample", affect_columns = selector_type(c("ordered", "factor"))) %>>%
+  po("imputemean")
+
+# 将上面定义的pl_missing 管道和逻辑回归结合成一个新的管道，可以在拟合前自动处理缺失数据
+pl_ranger <- pl_missing %>>% po(lrn_ranger)
+pl_log_reg <- pl_missing %>>% po(lrn_log_reg)
+```
+
+## 对不接受因子变量的模型进行数据处理
+
+```{r}
+pl_xgb <- po("encode") %>>% po(lrn_xgboost)
+```
+
+# 初步判断模型性能
+
+```{r}
+
+res <- benchmark(data.table(
+  task       = list(iscanceled_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+                    pl_log_reg,
+                    pl_xgb,
+                    lrn_baseline,
+                    lrn_cart,
+                    pl_ranger
+                    ),
+  resampling = list(cv5)
+  ), 
+  store_models = TRUE
+)
+
+
+res$aggregate(list(msr("classif.ce"), # 分类误差
+                   msr("classif.acc"), # 分类准确率
+                   msr("classif.auc"), # AUC（曲线下面积
+                   msr("classif.fpr"), # 假正例率
+                   msr("classif.fnr"))) # 假负例率
+```
+
+
+
+```{r}
+
+library(mlr3)
+library(mlr3tuning)
+library(mlr3learners)
+library(paradox)
+library(mlr3pipelines)
+
+
+# 假设 iscanceled_task 是你的任务变量
+# 先对任务中的分类特征进行编码
+graph <- po("encode") %>>% po("learner", learner = lrn("classif.xgboost", predict_type = "prob"))
+learner <- GraphLearner$new(graph)
+
+# 超参数空间，注意这里的参数名称调整
+param_set <- ParamSet$new(list(
+  ParamDbl$new("classif.xgboost.eta", lower = 0.01, upper = 0.3), # 注意这里的调整
+  ParamInt$new("classif.xgboost.max_depth", lower = 3, upper = 10),
+  ParamDbl$new("classif.xgboost.subsample", lower = 0.5, upper = 1),
+  ParamDbl$new("classif.xgboost.colsample_bytree", lower = 0.5, upper = 1)
+))
+
+
+# 交叉验证和终止条件
+cv5 <- rsmp("cv", folds = 5)
+cv5$instantiate(iscanceled_task)
+
+instance <- TuningInstanceSingleCrit$new(
+  task = iscanceled_task,
+  learner = learner,
+  resampling = cv5,
+  measure = msr("classif.auc"),
+  search_space = param_set,
+  terminator = trm("evals", n_evals = 50)
+)
+# 执行调参
+tuner$optimize(instance)
+
+# 查看最佳参数和性能
+# best_params <- instance$result$param_set$values
+# print(best_params)
+# 
+# best_perf <- instance$result$performance
+# print(best_perf)
+
+instance$result 
+```
+
+            
+```{r}
+instance$result
+
+
+instance$result$classif.xgboost.eta
+
+
+instance$result$classif.xgboost.max_depth
+
+
+instance$result$classif.xgboost.subsample
+
+instance$result$classif.xgboost.colsample_bytree
+
+
+library(mlr3)
+library(mlr3tuning)
+library(mlr3learners)
+library(mlr3pipelines)
+library(mlr3measures)
+
+# 假设您已经通过调参过程得到了最佳参数，并且iscanceled_task和cv5已经被定义
+learner_xgb <- lrn("classif.xgboost", predict_type = "prob")
+learner_xgb$param_set$values <- list(
+  eta = instance$result$classif.xgboost.eta,
+  max_depth = instance$result$classif.xgboost.max_depth,
+  subsample = instance$result$classif.xgboost.subsample,
+  colsample_bytree = instance$result$classif.xgboost.colsample_bytree
+)
+
+
+# 使用管道操作处理分类特征并引入配置了最佳参数的XGBoost学习器
+pl_xgb_best <- po("encode") %>>% po("learner", learner = learner_xgb, id = "xgb_best")
+
+# 执行基准测试
+res <- benchmark(data.table(
+  task       = list(iscanceled_task),
+  learner    = list(lrn_baseline, pl_xgb_best),
+  resampling = list(cv5)
+), store_models = TRUE)
+
+# 聚合基准测试结果
+res_aggregated <- res$aggregate(list(
+  msr("classif.ce"),  # 分类误差
+  msr("classif.acc"), # 分类准确率
+  msr("classif.auc"), # AUC（曲线下面积
+  msr("classif.fpr"), # 假正例率
+  msr("classif.fnr")  # 假负例率
+))
+
+print(res_aggregated)
+
+
+
+
+```
+
+
+
+
+```{r}
+print(learner_xgb$param_set)
+```
+
+
+## 对不接受因子变量的模型进行数据处理
+
+```{r}
+pl_xgb_best <- po("encode") %>>% po(learner_xgb)
+```
+
+# 初步判断模型性能
+
+
+## 对逻辑回归模型调参
+
+```{r}
+library(paradox)
+library(mlr3tuning)
+
+```
+
+
+
+```{r}
+
+library(mlr3)
+library(mlr3tuning)
+library(mlr3learners)
+library(mlr3pipelines)
+library(mlr3measures)
+
+# 假设您已经定义了最佳参数的learner_xgb，以及预处理任务的iscanceled_task和cv5
+
+# 创建一个管道，先进行编码处理，再使用设置好的XGBoost学习器
+pl_xgb_best <- po("encode") %>>% po("learner", learner = learner_xgb)
+
+# 为基准测试准备数据表
+design <- benchmark_grid(
+  tasks = iscanceled_task,
+  learners = list(lrn_baseline, lrn_cart, pl_log_reg, pl_xgb, pl_xgb_best),
+  resamplings = cv5
+)
+
+# 执行基准测试
+bmr <- benchmark(design, store_models = TRUE)
+
+# 获取聚合结果
+bmr_results <- bmr$aggregate(list(msr("classif.ce"),  # 分类误差
+                                  msr("classif.acc"), # 分类准确率
+                                  msr("classif.auc"), # AUC
+                                  msr("classif.fpr"), # 假正例率
+                                  msr("classif.fnr")  # 假负例率
+))
+
+
+print(bmr_results)
+
+
+
+```
+
+
+
+## 使用调好参的模型再次进行训练预测和交叉验证，查看最终模型性能
+
+
+
+
