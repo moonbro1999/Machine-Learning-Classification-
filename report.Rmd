@@ -166,7 +166,6 @@ res <- benchmark(data.table(
   learner    = list(lrn_baseline,
                     lrn_cart,
                     pl_log_reg,
-                    lrn_lda,
                     pl_xgb
                     
                     ),
